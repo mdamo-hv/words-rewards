@@ -103,6 +103,28 @@ Nemotron when it is one of these aliases, starts with `nvidia/`, or contains
 `nemotron`; prefix it explicitly with `nemotron:` or `anthropic:` when that guess
 would be wrong (for example `--judge-model nemotron:my-org/custom-build`).
 
+**Pick a capable judge.** The judge is what turns the explanation into a number,
+and small models grade badly — a 4B Nemotron scored a deliberately wrong
+explanation ("serendipity: a type of Italian pasta") at 0.5 while its own
+rationale said it was unrelated. Put the small model under test as the
+*explainer* and keep a large model as the judge.
+
+**Self-hosted endpoints.** `WR_NEMOTRON_BASE_URL` points the Nemotron backend at
+any OpenAI-compatible server — a self-hosted NIM, vLLM, or `llama-server` — so a
+local Nemotron build works without an NVIDIA key:
+
+```bash
+WR_NEMOTRON_BASE_URL=http://127.0.0.1:8899/v1 NVIDIA_API_KEY=local \
+  python -m words_rewards --word serendipity \
+    --explainer-model nvidia/Llama-3.1-Nemotron-Nano-4B-v1.1 \
+    --judge-model nvidia/Llama-3.1-Nemotron-Nano-4B-v1.1
+```
+
+**When a model id goes stale.** NVIDIA retires catalogue ids, and a retired one
+answers `410 Gone`. The run stops with the id named and a pointer to
+`--list-models`, which queries `GET /v1/models` live (no API key needed) and
+flags any built-in alias the catalogue has dropped.
+
 **How effort maps onto each backend.** `--explainer-effort` / `--judge-effort`
 take `low`…`max`. On Claude they set `output_config.effort` alongside adaptive
 thinking. On Nemotron, `high` and above send `detailed thinking on` with NVIDIA's

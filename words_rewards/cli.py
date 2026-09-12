@@ -17,10 +17,22 @@ from words_rewards.judge import ClaudeJudge
 from words_rewards.llm import MissingCredentialsError, build_client
 from words_rewards.mock import OverlapJudge, TemplateExplainer
 from words_rewards.models import RunRecord
-from words_rewards.nemotron import NemotronExplainer, NemotronJudge, NemotronWordSource
+from words_rewards.nemotron import (
+    NemotronError,
+    NemotronExplainer,
+    NemotronJudge,
+    NemotronWordSource,
+    catalogue_models,
+)
 from words_rewards.nemotron import build_client as build_nemotron_client
 from words_rewards.pipeline import Pipeline
-from words_rewards.providers import ANTHROPIC, NEMOTRON, describe_catalogue, resolve_model
+from words_rewards.providers import (
+    ANTHROPIC,
+    NEMOTRON,
+    NEMOTRON_ALIASES,
+    describe_aliases,
+    resolve_model,
+)
 from words_rewards.sourcing import (
     DEFAULT_INSTRUCTION,
     AgenticWordSource,
@@ -86,7 +98,10 @@ def build_parser() -> argparse.ArgumentParser:
     models.add_argument(
         "--list-models",
         action="store_true",
-        help="Print the built-in Nemotron aliases and exit.",
+        help=(
+            "Print the Nemotron aliases plus the models NVIDIA's catalogue "
+            "currently serves, then exit. Needs no API key."
+        ),
     )
     models.add_argument(
         "--judge-effort",
@@ -140,6 +155,38 @@ def build_parser() -> argparse.ArgumentParser:
         "-v", "--verbose", action="store_true", help="Log each stage as it runs."
     )
     return parser
+
+
+def list_models(args: argparse.Namespace) -> str:
+    """The alias table, plus whatever the catalogue says it serves today."""
+    settings = settings_from_args(args)
+    sections = [describe_aliases()]
+    try:
+        served = catalogue_models(settings)
+    except NemotronError as exc:
+        sections.append(
+            f"\nCould not reach {settings.nemotron_base_url} to check which "
+            f"models are live ({exc}). The aliases above were correct when "
+            "this version shipped; NVIDIA retires ids over time."
+        )
+    else:
+        sections.append(
+            f"\nNemotron models {settings.nemotron_base_url} serves right now:"
+        )
+        sections.extend(f"  {model_id}" for model_id in served)
+        stale = sorted(
+            {
+                model_id
+                for model_id in NEMOTRON_ALIASES.values()
+                if model_id not in served
+            }
+        )
+        if stale:
+            sections.append(
+                "\nAliases pointing at ids the catalogue no longer lists "
+                "(they answer 410): " + ", ".join(stale)
+            )
+    return "\n".join(sections)
 
 
 def settings_from_args(args: argparse.Namespace) -> Settings:
@@ -252,7 +299,7 @@ def summarise(records: list[RunRecord], settings: Settings) -> str:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.list_models:
-        print(describe_catalogue())
+        print(list_models(args))
         return 0
 
     logging.basicConfig(

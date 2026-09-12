@@ -13,6 +13,7 @@ import logging
 import os
 import re
 
+import requests
 from pydantic import ValidationError
 
 from words_rewards import explainer as explainer_prompts
@@ -38,11 +39,20 @@ REASONING_EFFORTS = frozenset({"high", "xhigh", "max"})
 
 _THINK_BLOCK = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 _OPEN_THINK = re.compile(r"^.*?</think>", re.DOTALL | re.IGNORECASE)
+_UNCLOSED_THINK = re.compile(r"<think>.*$", re.DOTALL | re.IGNORECASE)
 _CODE_FENCE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
 
 
 class NemotronError(RuntimeError):
     """Raised when a Nemotron call cannot be completed."""
+
+
+class NemotronApiError(NemotronError):
+    """A Nemotron call the endpoint answered with an HTTP error status."""
+
+    def __init__(self, message: str, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 def api_key() -> str | None:
@@ -93,11 +103,16 @@ def sampling(effort: str) -> dict[str, float]:
 
 
 def strip_reasoning(text: str) -> str:
-    """Drop the ``<think>`` block reasoning models prepend to their answer."""
+    """Drop the ``<think>`` block reasoning models prepend to their answer.
+
+    A block left unterminated - which is what a reply cut off mid-reasoning
+    looks like - is dropped too, so raw chain of thought never reaches the
+    judge as if it were the answer.
+    """
     without_blocks = _THINK_BLOCK.sub("", text)
     if "</think>" in without_blocks:
         without_blocks = _OPEN_THINK.sub("", without_blocks)
-    return without_blocks.strip()
+    return _UNCLOSED_THINK.sub("", without_blocks).strip()
 
 
 def extract_json(text: str) -> dict:
@@ -116,7 +131,76 @@ def extract_json(text: str) -> dict:
     raise NemotronError(f"no JSON object in the reply: {cleaned[:200]!r}")
 
 
+def catalogue_models(settings: Settings | None = None) -> list[str]:
+    """Ask the catalogue which Nemotron models it currently serves.
+
+    ``GET /v1/models`` needs no API key, so this works before the user has a
+    credential - and it is the only way to know that an id has not been retired.
+    """
+    settings = settings or Settings()
+    url = settings.nemotron_base_url.rstrip("/") + "/models"
+    headers = {}
+    key = api_key()
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    try:
+        response = requests.get(url, headers=headers, timeout=settings.http_timeout)
+        response.raise_for_status()
+        served = response.json().get("data", [])
+    except (requests.RequestException, ValueError) as exc:
+        raise NemotronError(f"could not list models from {url}: {exc}") from exc
+    return sorted(
+        entry["id"]
+        for entry in served
+        if "nemotron" in str(entry.get("id", "")).lower()
+    )
+
+
+def _create(client, **kwargs):
+    """Send one chat completion, turning routing failures into clear advice."""
+    try:
+        return client.chat.completions.create(**kwargs)
+    except Exception as exc:
+        status = getattr(exc, "status_code", None)
+        model = kwargs.get("model")
+        if status == 410:
+            raise NemotronApiError(
+                f"{model!r} has been retired from NVIDIA's catalogue. Run "
+                "`python -m words_rewards --list-models` to see what it serves "
+                "now.",
+                status,
+            ) from exc
+        if status == 404:
+            raise NemotronApiError(
+                f"NVIDIA's catalogue does not serve {model!r}. Run "
+                "`python -m words_rewards --list-models` for the current list.",
+                status,
+            ) from exc
+        if status in (401, 403):
+            raise NemotronError(
+                f"NVIDIA rejected the credentials for {model!r} (HTTP {status}). "
+                "Check NVIDIA_API_KEY."
+            ) from exc
+        if status is not None:
+            raise NemotronApiError(
+                f"the Nemotron endpoint returned HTTP {status} for {model!r}: "
+                f"{exc}",
+                status,
+            ) from exc
+        if type(exc).__module__.split(".")[0] == "openai":
+            raise NemotronError(
+                f"could not reach the Nemotron endpoint for {model!r}: {exc}"
+            ) from exc
+        raise
+
+
 def _message_text(choice) -> str:
+    if choice.finish_reason == "length":
+        raise NemotronError(
+            "the reply hit max_tokens before the model finished, so it is "
+            "incomplete. Raise WR_MAX_TOKENS, or lower the effort so the model "
+            "reasons less."
+        )
     content = choice.message.content or ""
     if not content.strip():
         raise NemotronError(
@@ -135,7 +219,8 @@ class NemotronExplainer:
 
     def explain(self, entry: WordEntry, *, show_meaning: bool = False) -> Explanation:
         effort = self.settings.explainer_effort
-        response = self.client.chat.completions.create(
+        response = _create(
+            self.client,
             model=self.model,
             max_tokens=self.settings.max_tokens,
             messages=[
@@ -214,8 +299,8 @@ class NemotronJudge:
                 },
             }
         try:
-            return self.client.chat.completions.create(**kwargs)
-        except Exception as exc:
+            return _create(self.client, **kwargs)
+        except NemotronApiError as exc:
             if self.schema_mode and _is_unsupported_format(exc):
                 logger.info(
                     "%s does not accept response_format; "
@@ -314,7 +399,8 @@ class NemotronWordSource:
         self.transcript = []
 
         for _ in range(self.max_iterations):
-            response = self.client.chat.completions.create(
+            response = _create(
+                self.client,
                 model=self.model,
                 max_tokens=self.settings.max_tokens,
                 messages=messages,

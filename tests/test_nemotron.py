@@ -13,6 +13,7 @@ from words_rewards.llm import MissingCredentialsError
 from words_rewards.models import Explanation, JudgeVerdict
 from words_rewards.nemotron import (
     NemotronError,
+    catalogue_models,
     NemotronExplainer,
     NemotronJudge,
     NemotronWordSource,
@@ -26,7 +27,8 @@ from words_rewards.nemotron import (
 from words_rewards.providers import (
     ANTHROPIC,
     NEMOTRON,
-    describe_catalogue,
+    NEMOTRON_ALIASES,
+    describe_aliases,
     provider_of,
     resolve_model,
 )
@@ -43,7 +45,7 @@ VERDICT_JSON = {
     "rationale": "Primary sense right, one sense missing.",
 }
 
-MODEL = "nvidia/llama-3.3-nemotron-super-49b-v1.5"
+MODEL = "nvidia/nemotron-3-super-120b-a12b"
 
 
 def completion(message: dict, finish_reason: str = "stop") -> ChatCompletion:
@@ -133,7 +135,7 @@ def nemotron_settings(**overrides) -> Settings:
     [
         ("claude-opus-5", (ANTHROPIC, "claude-opus-5")),
         ("nemotron-super", (NEMOTRON, MODEL)),
-        ("NEMOTRON-NANO", (NEMOTRON, "nvidia/nvidia-nemotron-nano-9b-v2")),
+        ("NEMOTRON-NANO", (NEMOTRON, "nvidia/nemotron-nano-3-30b-a3b")),
         ("nvidia/llama-3.1-nemotron-70b-instruct", (NEMOTRON, "nvidia/llama-3.1-nemotron-70b-instruct")),
         ("nemotron:my-org/custom", (NEMOTRON, "my-org/custom")),
         ("anthropic:claude-sonnet-5", (ANTHROPIC, "claude-sonnet-5")),
@@ -153,8 +155,8 @@ def test_unusable_model_names_are_rejected(model):
         resolve_model(model)
 
 
-def test_catalogue_lists_every_alias():
-    text = describe_catalogue()
+def test_alias_table_lists_every_alias():
+    text = describe_aliases()
     assert "nemotron-super" in text
     assert MODEL in text
 
@@ -181,10 +183,28 @@ def test_sampling_is_greedy_when_reasoning_is_off():
         ("<think>hmm</think>The answer.", "The answer."),
         ("reasoning first</think>The answer.", "The answer."),
         ("No reasoning here.", "No reasoning here."),
+        ("Answer.<think>afterthought", "Answer."),
     ],
 )
 def test_strip_reasoning(raw, expected):
     assert strip_reasoning(raw) == expected
+
+
+def test_strip_reasoning_drops_an_unterminated_block():
+    """A reply cut off mid-reasoning must not be mistaken for an answer."""
+    truncated = "<think>Okay, the user wants an explanation of serendipity. Let me"
+    assert strip_reasoning(truncated) == ""
+
+
+def test_a_truncated_reply_is_an_error_not_an_explanation(entry):
+    client = FakeOpenAI(
+        completion(
+            {"role": "assistant", "content": "<think>still reasoning about the"},
+            finish_reason="length",
+        )
+    )
+    with pytest.raises(NemotronError, match="hit max_tokens"):
+        NemotronExplainer(client, nemotron_settings()).explain(entry)
 
 
 def test_extract_json_handles_fences_and_reasoning():
@@ -281,13 +301,24 @@ def test_judge_falls_back_when_the_endpoint_rejects_response_format(
     assert "JSON schema" in client.calls[1]["messages"][1]["content"]
 
 
-def test_judge_reraises_unrelated_api_errors(entry, explanation):
+def test_judge_surfaces_an_unrelated_api_error(entry, explanation):
     class Boom(Exception):
         status_code = 500
 
     client = FakeOpenAI(Boom("upstream exploded"))
-    with pytest.raises(Boom):
-        NemotronJudge(client, nemotron_settings()).judge(entry, explanation)
+    judge = NemotronJudge(client, nemotron_settings())
+
+    with pytest.raises(NemotronError, match="HTTP 500"):
+        judge.judge(entry, explanation)
+    assert judge.schema_mode is True
+
+
+def test_a_connection_failure_is_reported_as_unreachable(entry):
+    import openai
+
+    client = FakeOpenAI(openai.APIConnectionError(request=None))
+    with pytest.raises(NemotronError, match="could not reach"):
+        NemotronExplainer(client, nemotron_settings()).explain(entry)
 
 
 def test_judge_retries_once_when_the_reply_is_not_a_verdict(entry, explanation):
@@ -445,11 +476,139 @@ def test_cli_uses_the_nemotron_agent_for_a_nemotron_sourcing_model(
     assert isinstance(pipeline.source, NemotronWordSource)
 
 
-def test_list_models_exits_cleanly(capsys):
-    from words_rewards.cli import main
+def test_list_models_exits_cleanly(monkeypatch, capsys):
+    from words_rewards import cli
 
-    assert main(["--list-models"]) == 0
+    monkeypatch.setattr(cli, "catalogue_models", lambda _settings: [MODEL])
+
+    assert cli.main(["--list-models"]) == 0
     assert "nemotron-super" in capsys.readouterr().out
+
+
+# ------------------------------------------------------- catalogue lookup
+
+
+class FakeGetResponse:
+    def __init__(self, payload):
+        self.payload = payload
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self.payload
+
+
+def test_catalogue_models_keeps_only_nemotron_ids(monkeypatch):
+    payload = {
+        "data": [
+            {"id": "nvidia/nemotron-3-super-120b-a12b"},
+            {"id": "meta/llama-3.3-70b-instruct"},
+            {"id": "nvidia/nemotron-nano-3-30b-a3b"},
+        ]
+    }
+    seen = {}
+
+    def fake_get(url, headers=None, timeout=None):
+        seen["url"] = url
+        return FakeGetResponse(payload)
+
+    monkeypatch.setattr("words_rewards.nemotron.requests.get", fake_get)
+
+    assert catalogue_models(Settings()) == [
+        "nvidia/nemotron-3-super-120b-a12b",
+        "nvidia/nemotron-nano-3-30b-a3b",
+    ]
+    assert seen["url"] == "https://integrate.api.nvidia.com/v1/models"
+
+
+def test_catalogue_models_reports_a_failed_lookup(monkeypatch):
+    import requests
+
+    def fake_get(*_args, **_kwargs):
+        raise requests.ConnectionError("no route to host")
+
+    monkeypatch.setattr("words_rewards.nemotron.requests.get", fake_get)
+
+    with pytest.raises(NemotronError, match="could not list models"):
+        catalogue_models(Settings())
+
+
+def test_list_models_names_the_served_models(monkeypatch, capsys):
+    from words_rewards import cli
+
+    monkeypatch.setattr(
+        cli, "catalogue_models", lambda _settings: list(NEMOTRON_ALIASES.values())
+    )
+    text = cli.list_models(cli.build_parser().parse_args([]))
+
+    assert "serves right now" in text
+    assert "nvidia/nemotron-3-super-120b-a12b" in text
+    assert "no longer lists" not in text
+
+
+def test_list_models_flags_an_alias_the_catalogue_dropped(monkeypatch):
+    from words_rewards import cli
+
+    served = [
+        model_id
+        for model_id in NEMOTRON_ALIASES.values()
+        if model_id != NEMOTRON_ALIASES["nemotron-super"]
+    ]
+    monkeypatch.setattr(cli, "catalogue_models", lambda _settings: served)
+
+    text = cli.list_models(cli.build_parser().parse_args([]))
+
+    assert "no longer lists" in text
+    assert NEMOTRON_ALIASES["nemotron-super"] in text.split("no longer lists")[1]
+
+
+def test_list_models_still_prints_aliases_when_the_catalogue_is_unreachable(
+    monkeypatch,
+):
+    from words_rewards import cli
+
+    def boom(_settings):
+        raise NemotronError("could not list models from http://nope/models")
+
+    monkeypatch.setattr(cli, "catalogue_models", boom)
+    text = cli.list_models(cli.build_parser().parse_args([]))
+
+    assert "nemotron-super" in text
+    assert "Could not reach" in text
+
+
+# --------------------------------------------------- routing failure advice
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        (410, "has been retired"),
+        (404, "does not serve"),
+        (401, "rejected the credentials"),
+        (403, "rejected the credentials"),
+    ],
+)
+def test_routing_failures_become_actionable_errors(entry, status, expected):
+    class ApiError(Exception):
+        status_code = status
+
+    client = FakeOpenAI(ApiError("boom"))
+    with pytest.raises(NemotronError, match=expected):
+        NemotronExplainer(client, nemotron_settings()).explain(entry)
+
+
+def test_a_retired_model_is_not_mistaken_for_a_schema_problem(entry, explanation):
+    class Gone(Exception):
+        status_code = 410
+
+    client = FakeOpenAI(Gone("response_format"))
+    judge = NemotronJudge(client, nemotron_settings())
+
+    with pytest.raises(NemotronError, match="has been retired"):
+        judge.judge(entry, explanation)
+    assert judge.schema_mode is True
 
 
 def test_verdict_from_a_nemotron_judge_is_the_same_shape():

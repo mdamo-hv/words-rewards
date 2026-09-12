@@ -9,13 +9,18 @@ from __future__ import annotations
 ANTHROPIC = "anthropic"
 NEMOTRON = "nemotron"
 
-#: Short names for the Nemotron models hosted on NVIDIA's API catalogue. Any
-#: other catalogue id works too - pass it in full, or prefix it with
-#: ``nemotron:`` if it does not look like a Nemotron model.
+#: Short names for Nemotron chat models on NVIDIA's API catalogue, verified
+#: against ``GET /v1/models`` on 2026-09-12. NVIDIA retires ids (a retired one
+#: answers ``410 Gone``), so ``--list-models`` also queries the live catalogue
+#: rather than trusting this table. Any catalogue id works in full too - pass it
+#: as-is, or prefix it with ``nemotron:`` if it does not look like a Nemotron
+#: model.
 NEMOTRON_ALIASES: dict[str, str] = {
-    "nemotron-nano": "nvidia/nvidia-nemotron-nano-9b-v2",
-    "nemotron-super": "nvidia/llama-3.3-nemotron-super-49b-v1.5",
-    "nemotron-ultra": "nvidia/llama-3.1-nemotron-ultra-253b-v1",
+    "nemotron-nano": "nvidia/nemotron-nano-3-30b-a3b",
+    "nemotron-lightning": "nvidia/nemotron-3.5-lightning-30b-a3b",
+    "nemotron-super": "nvidia/nemotron-3-super-120b-a12b",
+    "nemotron-ultra": "nvidia/nemotron-3-ultra-550b-a55b",
+    "nemotron-ultra-253b": "nvidia/llama-3.1-nemotron-ultra-253b-v1",
     "nemotron-70b": "nvidia/llama-3.1-nemotron-70b-instruct",
 }
 
@@ -28,7 +33,7 @@ def resolve_model(model: str) -> tuple[str, str]:
     >>> resolve_model("claude-opus-5")
     ('anthropic', 'claude-opus-5')
     >>> resolve_model("nemotron-super")
-    ('nemotron', 'nvidia/llama-3.3-nemotron-super-49b-v1.5')
+    ('nemotron', 'nvidia/nemotron-3-super-120b-a12b')
     >>> resolve_model("nemotron:my-org/custom-build")
     ('nemotron', 'my-org/custom-build')
     """
@@ -55,7 +60,7 @@ def provider_of(model: str) -> str:
     return resolve_model(model)[0]
 
 
-def describe_catalogue() -> str:
+def describe_aliases() -> str:
     """Human-readable list of the built-in Nemotron aliases."""
     width = max(len(alias) for alias in NEMOTRON_ALIASES)
     lines = ["Nemotron aliases (NVIDIA API catalogue ids):"]
