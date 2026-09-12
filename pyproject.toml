@@ -1,0 +1,29 @@
+[project]
+name = "words-rewards"
+version = "0.1.0"
+description = "Score how well an LLM understands dictionary.com words, using an LLM as the judge."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "anthropic>=1.5.0",
+    "beautifulsoup4>=4.13",
+    "pydantic>=2.7",
+    "requests>=2.32",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+words-rewards = "words_rewards.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["words_rewards"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
