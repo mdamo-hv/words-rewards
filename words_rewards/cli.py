@@ -7,6 +7,7 @@ import json
 import logging
 import random
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 from words_rewards.config import EFFORT_LEVELS, Settings
@@ -16,7 +17,10 @@ from words_rewards.judge import ClaudeJudge
 from words_rewards.llm import MissingCredentialsError, build_client
 from words_rewards.mock import OverlapJudge, TemplateExplainer
 from words_rewards.models import RunRecord
+from words_rewards.nemotron import NemotronExplainer, NemotronJudge, NemotronWordSource
+from words_rewards.nemotron import build_client as build_nemotron_client
 from words_rewards.pipeline import Pipeline
+from words_rewards.providers import ANTHROPIC, NEMOTRON, describe_catalogue, resolve_model
 from words_rewards.sourcing import (
     DEFAULT_INSTRUCTION,
     AgenticWordSource,
@@ -64,9 +68,26 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     models = parser.add_argument_group("models")
-    models.add_argument("--sourcing-model", help="Model for the sourcing agent.")
-    models.add_argument("--explainer-model", help="Model under test.")
-    models.add_argument("--judge-model", help="Model acting as the judge.")
+    models.add_argument(
+        "--sourcing-model",
+        help="Model for the sourcing agent (Claude or Nemotron).",
+    )
+    models.add_argument(
+        "--explainer-model",
+        help=(
+            "Model under test. Accepts a Claude id, a Nemotron alias such as "
+            "nemotron-super, or any NVIDIA catalogue id."
+        ),
+    )
+    models.add_argument(
+        "--judge-model",
+        help="Model acting as the judge (Claude or Nemotron).",
+    )
+    models.add_argument(
+        "--list-models",
+        action="store_true",
+        help="Print the built-in Nemotron aliases and exit.",
+    )
     models.add_argument(
         "--judge-effort",
         choices=EFFORT_LEVELS,
@@ -138,26 +159,67 @@ def settings_from_args(args: argparse.Namespace) -> Settings:
     return settings
 
 
+class ClientPool:
+    """Builds one API client per provider, on first use."""
+
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+        self._clients: dict[str, object] = {}
+
+    def get(self, provider: str):
+        if provider not in self._clients:
+            builder = build_client if provider == ANTHROPIC else build_nemotron_client
+            self._clients[provider] = builder(self.settings)
+        return self._clients[provider]
+
+
+def _stage(settings: Settings, field: str) -> tuple[str, Settings]:
+    """Resolve one stage's model to ``(provider, settings-with-that-model)``."""
+    provider, model_id = resolve_model(getattr(settings, field))
+    return provider, replace(settings, **{field: model_id})
+
+
 def build_pipeline(args: argparse.Namespace, settings: Settings) -> Pipeline:
     dictionary = DictionaryClient(settings)
     rng = random.Random(args.seed) if args.seed is not None else None
 
     if args.mock:
-        explainer = TemplateExplainer()
-        judge = OverlapJudge()
-        client = None
-    else:
-        client = build_client(settings)
-        explainer = ClaudeExplainer(client, settings)
-        judge = ClaudeJudge(client, settings)
+        return Pipeline(
+            source=DirectWordSource(dictionary, word=args.word, rng=rng),
+            explainer=TemplateExplainer(),
+            judge=OverlapJudge(),
+            settings=settings,
+            show_meaning_to_explainer=args.show_meaning_to_explainer,
+        )
+
+    clients = ClientPool(settings)
+
+    provider, stage_settings = _stage(settings, "explainer_model")
+    explainer = (
+        ClaudeExplainer(clients.get(provider), stage_settings)
+        if provider == ANTHROPIC
+        else NemotronExplainer(clients.get(provider), stage_settings)
+    )
+
+    provider, stage_settings = _stage(settings, "judge_model")
+    judge = (
+        ClaudeJudge(clients.get(provider), stage_settings)
+        if provider == ANTHROPIC
+        else NemotronJudge(clients.get(provider), stage_settings)
+    )
 
     if args.word:
         source = DirectWordSource(dictionary, word=args.word)
-    elif args.random or client is None:
+    elif args.random:
         source = DirectWordSource(dictionary, rng=rng)
     else:
-        source = AgenticWordSource(
-            client, dictionary, settings, instruction=args.instruction
+        provider, stage_settings = _stage(settings, "sourcing_model")
+        agent = AgenticWordSource if provider == ANTHROPIC else NemotronWordSource
+        source = agent(
+            clients.get(provider),
+            dictionary,
+            stage_settings,
+            instruction=args.instruction,
         )
 
     return Pipeline(
@@ -180,11 +242,19 @@ def summarise(records: list[RunRecord], settings: Settings) -> str:
         f"\naverage score {average:.3f} over {len(records)} word(s) "
         f"(threshold {settings.pass_threshold:.2f})"
     )
+    lines.append(
+        f"explainer {records[0].explanation.model} "
+        f"| judge {records[0].judge_model}"
+    )
     return "\n".join(lines)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.list_models:
+        print(describe_catalogue())
+        return 0
+
     logging.basicConfig(
         level=logging.INFO if args.verbose else logging.WARNING,
         format="%(levelname)s %(name)s: %(message)s",

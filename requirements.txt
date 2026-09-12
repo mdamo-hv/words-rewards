@@ -1,4 +1,5 @@
 anthropic>=1.5.0
 beautifulsoup4>=4.13
+openai>=1.60
 pydantic>=2.7
 requests>=2.32

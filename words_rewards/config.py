@@ -49,6 +49,9 @@ class Settings:
     max_tokens: int = 8000
     request_timeout: float = 180.0
 
+    # Nemotron models are served from NVIDIA's OpenAI-compatible catalogue.
+    nemotron_base_url: str = "https://integrate.api.nvidia.com/v1"
+
     # Scraping.
     dictionary_base_url: str = "https://www.dictionary.com"
     http_timeout: float = 30.0
@@ -76,6 +79,9 @@ class Settings:
             judge_effort=_env_str("WR_JUDGE_EFFORT", "high"),
             max_tokens=_env_int("WR_MAX_TOKENS", 8000),
             request_timeout=_env_float("WR_REQUEST_TIMEOUT", 180.0),
+            nemotron_base_url=_env_str(
+                "WR_NEMOTRON_BASE_URL", "https://integrate.api.nvidia.com/v1"
+            ),
             http_timeout=_env_float("WR_HTTP_TIMEOUT", 30.0),
             http_retries=_env_int("WR_HTTP_RETRIES", 3),
             pass_threshold=_env_float("WR_PASS_THRESHOLD", 0.7),

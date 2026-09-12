@@ -5,8 +5,9 @@ description = "Score how well an LLM understands dictionary.com words, using an 
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "anthropic>=1.5.0",
+    "anthropic>=1.5.0",          # Claude stages
     "beautifulsoup4>=4.13",
+    "openai>=1.60",              # Nemotron stages, via NVIDIA's OpenAI-compatible API
     "pydantic>=2.7",
     "requests>=2.32",
 ]

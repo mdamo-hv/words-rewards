@@ -9,7 +9,9 @@ Two implementations are available:
 ``AgenticWordSource``
     An agent loop: Claude is handed the dictionary tools and decides which word
     to pull, which is what you want when the selection itself needs judgement
-    ("something a language learner would trip over", "a legal term", ...).
+    ("something a language learner would trip over", "a legal term", ...). The
+    Nemotron equivalent is ``nemotron.NemotronWordSource``; both drive the same
+    tools built by :func:`build_dictionary_tools`.
 """
 
 from __future__ import annotations
@@ -20,6 +22,7 @@ from typing import Protocol
 
 import anthropic
 from anthropic import beta_tool
+from anthropic.lib.tools import BetaFunctionTool
 
 from words_rewards.config import Settings
 from words_rewards.dictionary_source import DictionaryClient, DictionaryError
@@ -48,6 +51,82 @@ DEFAULT_INSTRUCTION = (
     "Pull one interesting English word and its meaning. Prefer a word that is "
     "real but not everyday vocabulary, so the benchmark is not trivially easy."
 )
+
+
+def build_dictionary_tools(
+    dictionary: DictionaryClient, captured: dict[str, WordEntry]
+) -> list[BetaFunctionTool]:
+    """Build the two dictionary.com tools the sourcing agent drives.
+
+    The entry a successful lookup returns is stashed in ``captured["entry"]``,
+    so the caller ends up with the scraped record rather than with whatever the
+    model says about it. The tools carry a JSON schema and are callable, which
+    is all either agent loop needs.
+    """
+
+    @beta_tool
+    def list_word_of_the_day() -> str:
+        """List the words dictionary.com currently features as Word of the Day.
+
+        Returns a JSON array of objects with `word`, `date`,
+        `part_of_speech` and a one-line `short_definition`.
+        """
+        try:
+            featured = dictionary.fetch_word_of_the_day()
+        except DictionaryError as exc:
+            return json.dumps({"error": str(exc)})
+        return json.dumps(
+            [
+                {
+                    "word": item.word,
+                    "date": item.date,
+                    "part_of_speech": item.part_of_speech,
+                    "short_definition": item.short_definition,
+                }
+                for item in featured
+            ]
+        )
+
+    @beta_tool
+    def fetch_dictionary_entry(word: str) -> str:
+        """Pull a word and its full meaning from dictionary.com.
+
+        Args:
+            word: The headword to look up, for example "serendipity".
+        """
+        try:
+            entry = dictionary.fetch_entry(word)
+        except DictionaryError as exc:
+            return json.dumps({"error": str(exc), "word": word})
+        captured["entry"] = entry
+        return json.dumps(
+            {
+                "word": entry.word,
+                "source_url": entry.source_url,
+                "pronunciation": entry.pronunciation,
+                "senses": [sense.model_dump() for sense in entry.senses],
+            }
+        )
+
+    return [list_word_of_the_day, fetch_dictionary_entry]
+
+
+def as_openai_tools(tools: list[BetaFunctionTool]) -> list[dict]:
+    """Render the same tools in the OpenAI-compatible shape Nemotron expects."""
+    specs = []
+    for tool in tools:
+        definition = tool.to_dict()
+        specs.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": definition["name"],
+                    "description": definition["description"],
+                    "parameters": definition["input_schema"],
+                },
+            }
+        )
+    return specs
 
 
 class WordSource(Protocol):
@@ -100,53 +179,7 @@ class AgenticWordSource:
         self.transcript: list[str] = []
 
     def _build_tools(self, captured: dict[str, WordEntry]):
-        dictionary = self.dictionary
-
-        @beta_tool
-        def list_word_of_the_day() -> str:
-            """List the words dictionary.com currently features as Word of the Day.
-
-            Returns a JSON array of objects with `word`, `date`,
-            `part_of_speech` and a one-line `short_definition`.
-            """
-            try:
-                featured = dictionary.fetch_word_of_the_day()
-            except DictionaryError as exc:
-                return json.dumps({"error": str(exc)})
-            return json.dumps(
-                [
-                    {
-                        "word": item.word,
-                        "date": item.date,
-                        "part_of_speech": item.part_of_speech,
-                        "short_definition": item.short_definition,
-                    }
-                    for item in featured
-                ]
-            )
-
-        @beta_tool
-        def fetch_dictionary_entry(word: str) -> str:
-            """Pull a word and its full meaning from dictionary.com.
-
-            Args:
-                word: The headword to look up, for example "serendipity".
-            """
-            try:
-                entry = dictionary.fetch_entry(word)
-            except DictionaryError as exc:
-                return json.dumps({"error": str(exc), "word": word})
-            captured["entry"] = entry
-            return json.dumps(
-                {
-                    "word": entry.word,
-                    "source_url": entry.source_url,
-                    "pronunciation": entry.pronunciation,
-                    "senses": [sense.model_dump() for sense in entry.senses],
-                }
-            )
-
-        return [list_word_of_the_day, fetch_dictionary_entry]
+        return build_dictionary_tools(self.dictionary, captured)
 
     def pull(self) -> WordEntry:
         captured: dict[str, WordEntry] = {}

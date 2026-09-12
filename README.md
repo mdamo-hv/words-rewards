@@ -15,7 +15,11 @@ dictionary words, and writes a score between 0 and 1 to a JSON file.
                                                                      { "word": …, "score": 0.85, … }
 ```
 
-1. **Sourcing agent** — Claude runs a tool loop over two dictionary.com tools
+Each stage runs on either **Claude** or an **NVIDIA Nemotron** model — pick per
+stage, so you can put Nemotron under test with Claude as the judge, or the other
+way round. See [Models](#models).
+
+1. **Sourcing agent** — the model runs a tool loop over two dictionary.com tools
    (`list_word_of_the_day`, `fetch_dictionary_entry`) and decides which word to
    pull. It may never write a definition itself; a word only counts once the
    scrape returns an entry.
@@ -25,9 +29,11 @@ dictionary words, and writes a score between 0 and 1 to a JSON file.
    paraphrasing rather than knowledge. Use `--show-meaning-to-explainer` for the
    other behaviour.
 3. **LLM-as-a-judge** — a second call gets the word, the dictionary entry and
-   the explanation, and returns a structured verdict (the Claude structured
-   outputs API, so the shape is guaranteed): a 0.0–1.0 `score` plus the rubric
-   sub-scores, hallucinations and missing senses behind it.
+   the explanation, and returns a structured verdict: a 0.0–1.0 `score` plus the
+   rubric sub-scores, hallucinations and missing senses behind it. On Claude
+   that uses the structured outputs API, so the shape is guaranteed; on Nemotron
+   it asks for a JSON schema and repairs the reply if the endpoint cannot
+   enforce one.
 4. **Storage** — every run is written to `results/<word>-<timestamp>.json` and
    appended to `results/scores.jsonl`.
 
@@ -36,8 +42,13 @@ dictionary words, and writes a score between 0 and 1 to a JSON file.
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt          # or: pip install -e '.[dev]'
-export ANTHROPIC_API_KEY=sk-ant-...      # see .env.example for optional settings
+
+export ANTHROPIC_API_KEY=sk-ant-...      # for Claude stages
+export NVIDIA_API_KEY=nvapi-...          # for Nemotron stages (build.nvidia.com)
 ```
+
+You only need a key for the backends you actually use, and neither for `--mock`.
+See `.env.example` for the optional settings.
 
 ## Run
 
@@ -59,10 +70,45 @@ python -m words_rewards --random --seed 42
 python -m words_rewards --mock --word serendipity
 ```
 
-Useful flags: `--judge-model` / `--explainer-model` (benchmark one model with
-another as judge), `--judge-effort` / `--explainer-effort`, `--threshold`,
+Useful flags: `--judge-effort` / `--explainer-effort`, `--threshold`,
 `--fail-under` (non-zero exit when the average score is too low), `--out`,
 `--print-json`. `python -m words_rewards --help` lists them all.
+
+## Models
+
+`--sourcing-model`, `--explainer-model` and `--judge-model` each take a Claude
+id or a Nemotron model; the backend follows from the name, so no extra flag is
+needed.
+
+```bash
+# Put Nemotron under test, keep Claude as the judge
+python -m words_rewards --explainer-model nemotron-super --judge-model claude-opus-5
+
+# Run every stage on Nemotron (only NVIDIA_API_KEY needed)
+WR_MODEL=nemotron-super python -m words_rewards
+
+# Any NVIDIA catalogue id works in full
+python -m words_rewards --explainer-model nvidia/llama-3.1-nemotron-70b-instruct
+```
+
+| Alias | NVIDIA catalogue id |
+| ----- | ------------------- |
+| `nemotron-nano` | `nvidia/nvidia-nemotron-nano-9b-v2` |
+| `nemotron-super` | `nvidia/llama-3.3-nemotron-super-49b-v1.5` |
+| `nemotron-ultra` | `nvidia/llama-3.1-nemotron-ultra-253b-v1` |
+| `nemotron-70b` | `nvidia/llama-3.1-nemotron-70b-instruct` |
+
+`python -m words_rewards --list-models` prints the same table. A name is read as
+Nemotron when it is one of these aliases, starts with `nvidia/`, or contains
+`nemotron`; prefix it explicitly with `nemotron:` or `anthropic:` when that guess
+would be wrong (for example `--judge-model nemotron:my-org/custom-build`).
+
+**How effort maps onto each backend.** `--explainer-effort` / `--judge-effort`
+take `low`…`max`. On Claude they set `output_config.effort` alongside adaptive
+thinking. On Nemotron, `high` and above send `detailed thinking on` with NVIDIA's
+recommended sampling (temperature 0.6, top-p 0.95) and anything lower sends
+`detailed thinking off` with greedy decoding; the `<think>` block reasoning
+models emit is stripped before the text is scored.
 
 ## Output
 
@@ -113,9 +159,11 @@ against what it happens to remember about the word:
 | Path | What it does |
 | ---- | ------------ |
 | `words_rewards/dictionary_source.py` | dictionary.com scraping and parsing |
+| `words_rewards/providers.py` | maps a model name to its backend |
 | `words_rewards/sourcing.py` | stage 1 — the agentic word source and its tools |
 | `words_rewards/explainer.py` | stage 2 — the model under test |
 | `words_rewards/judge.py` | stage 3 — LLM-as-a-judge, structured output |
+| `words_rewards/nemotron.py` | all three stages on NVIDIA Nemotron models |
 | `words_rewards/pipeline.py` | orchestration and retries |
 | `words_rewards/storage.py` | JSON result files and the `scores.jsonl` index |
 | `words_rewards/mock.py` | deterministic stand-ins used by `--mock` and the tests |
@@ -129,7 +177,8 @@ pytest
 ```
 
 The suite runs fully offline: the dictionary pages are saved as fixtures under
-`tests/fixtures/`, and the Claude calls go through fake clients.
+`tests/fixtures/`, and both the Claude and the Nemotron calls go through fake
+clients.
 
 ## Notes
 
